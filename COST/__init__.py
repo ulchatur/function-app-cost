@@ -5,6 +5,7 @@ import os
 import io
 import logging
 from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 import azure.functions as func
 
 # Setup logging
@@ -40,14 +41,30 @@ def get_previous_month_range():
     first_day_prev_month = last_day_prev_month.replace(day=1)
     return first_day_prev_month.isoformat(), last_day_prev_month.isoformat()
 
-def fetch_cost(token, start_date, end_date):
+def get_all_subscriptions(token):
+    """Fetch all subscriptions accessible to the service principal"""
     try:
-        SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID")
+        url = "https://management.azure.com/subscriptions?api-version=2020-01-01"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
         
-        if not SUBSCRIPTION_ID:
-            raise ValueError("Missing environment variable: SUBSCRIPTION_ID")
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
         
-        url = f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/query?api-version=2023-03-01"
+        subscriptions = response.json().get("value", [])
+        logger.info(f"Found {len(subscriptions)} subscriptions")
+        
+        return subscriptions
+    except Exception as e:
+        logger.error(f"Error fetching subscriptions: {str(e)}")
+        raise
+
+def fetch_cost_for_subscription(token, subscription_id, start_date, end_date):
+    """Fetch cost data for a specific subscription"""
+    try:
+        url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.CostManagement/query?api-version=2023-03-01"
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -76,62 +93,82 @@ def fetch_cost(token, start_date, end_date):
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        logger.error(f"Error fetching cost: {str(e)}")
-        raise
+        logger.error(f"Error fetching cost for subscription {subscription_id}: {str(e)}")
+        # Return empty structure if cost fetch fails
+        return {"properties": {"rows": [], "columns": []}}
 
-def generate_excel(cost, start_date, end_date):
+def generate_excel(all_costs_data, start_date, end_date):
+    """Generate Excel with all subscriptions cost data"""
     try:
-        SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID")
-        
         wb = Workbook()
         ws = wb.active
         ws.title = "Azure Cost Report"
 
-        ws.append([
-            "Subscription ID",
-            "From Date",
-            "To Date",
-            "Total Cost",
-            "Currency"
-        ])
+        # Header styling
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        
+        # Add headers
+        headers = ["Subscription Name", "Subscription ID", "From Date", "To Date", "Total Cost (USD)", "Status"]
+        ws.append(headers)
+        
+        # Style header row
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        # Safely extract cost data
-        properties = cost.get("properties", {})
-        rows = properties.get("rows", [])
-        columns = properties.get("columns", [])
+        total_cost_all = 0.0
         
-        # Log for debugging
-        logger.info(f"Number of rows: {len(rows)}")
-        logger.info(f"Columns: {columns}")
-        
-        if not rows or len(rows) == 0:
-            # No cost data found - might be new subscription or no usage
-            logger.warning("No cost data found in response. This might be a new subscription or no usage in the selected period.")
-            total_cost = 0.0
-            currency = "USD"
-        else:
-            # Extract cost from first row
-            total_cost = rows[0][0] if len(rows[0]) > 0 else 0.0
+        # Add data for each subscription
+        for sub_data in all_costs_data:
+            subscription_name = sub_data["subscription_name"]
+            subscription_id = sub_data["subscription_id"]
+            cost_data = sub_data["cost_data"]
             
-            # Try to get currency from columns
-            currency = "USD"  # default
-            for col in columns:
-                if col.get("name") == "Currency":
-                    currency = rows[0][columns.index(col)] if len(rows[0]) > columns.index(col) else "USD"
-                    break
+            # Extract cost
+            rows = cost_data.get("properties", {}).get("rows", [])
+            
+            if not rows or len(rows) == 0:
+                total_cost = 0.0
+                status = "No usage data"
+            else:
+                total_cost = float(rows[0][0]) if len(rows[0]) > 0 else 0.0
+                status = "Active"
+            
+            total_cost_all += total_cost
+            
+            ws.append([
+                subscription_name,
+                subscription_id,
+                start_date,
+                end_date,
+                round(total_cost, 2),
+                status
+            ])
 
-        ws.append([
-            SUBSCRIPTION_ID,
-            start_date,
-            end_date,
-            f"{total_cost:.2f}",
-            currency
-        ])
+        # Add total row
+        ws.append([])
+        total_row = ws.max_row
+        ws.append(["TOTAL", "", "", "", round(total_cost_all, 2), ""])
+        
+        # Style total row
+        for cell in ws[total_row]:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
 
-        # Add note if no data
-        if not rows:
-            ws.append([])
-            ws.append(["Note: No cost data available for the selected period"])
+        # Adjust column widths
+        ws.column_dimensions['A'].width = 35
+        ws.column_dimensions['B'].width = 40
+        ws.column_dimensions['C'].width = 15
+        ws.column_dimensions['D'].width = 15
+        ws.column_dimensions['E'].width = 20
+        ws.column_dimensions['F'].width = 15
+
+        # Add summary info
+        ws.append([])
+        ws.append([f"Report Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+        ws.append([f"Total Subscriptions: {len(all_costs_data)}"])
 
         file_stream = io.BytesIO()
         wb.save(file_stream)
@@ -146,7 +183,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     
     try:
         # Check environment variables
-        required_vars = ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET", "SUBSCRIPTION_ID"]
+        required_vars = ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET"]
         missing_vars = [var for var in required_vars if not os.environ.get(var)]
         
         if missing_vars:
@@ -165,18 +202,38 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         start_date, end_date = get_previous_month_range()
         logger.info(f"Date range: {start_date} to {end_date}")
         
-        logger.info(f"Fetching cost data from {start_date} to {end_date}...")
-        cost_data = fetch_cost(token, start_date, end_date)
+        logger.info("Fetching all subscriptions...")
+        subscriptions = get_all_subscriptions(token)
         
-        # Log the actual response for debugging
-        logger.info(f"Cost data response keys: {cost_data.keys()}")
-        logger.info(f"Cost data properties keys: {cost_data.get('properties', {}).keys()}")
-        logger.info(f"Rows count: {len(cost_data.get('properties', {}).get('rows', []))}")
+        if not subscriptions:
+            return func.HttpResponse(
+                body=json.dumps({"error": "No subscriptions found"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+        
+        logger.info(f"Processing {len(subscriptions)} subscriptions...")
+        
+        # Fetch cost for each subscription
+        all_costs_data = []
+        for subscription in subscriptions:
+            sub_id = subscription.get("subscriptionId")
+            sub_name = subscription.get("displayName", "Unknown")
+            
+            logger.info(f"Fetching cost for: {sub_name} ({sub_id})")
+            
+            cost_data = fetch_cost_for_subscription(token, sub_id, start_date, end_date)
+            
+            all_costs_data.append({
+                "subscription_id": sub_id,
+                "subscription_name": sub_name,
+                "cost_data": cost_data
+            })
         
         logger.info("Generating Excel file...")
-        excel_file = generate_excel(cost_data, start_date, end_date)
+        excel_file = generate_excel(all_costs_data, start_date, end_date)
 
-        filename = f"azure_cost_{start_date}_to_{end_date}.xlsx"
+        filename = f"azure_all_subscriptions_cost_{start_date}_to_{end_date}.xlsx"
 
         logger.info("Returning Excel file...")
         return func.HttpResponse(
