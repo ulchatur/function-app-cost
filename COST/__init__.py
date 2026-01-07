@@ -258,9 +258,6 @@
 #         )
 
 
-
-
-
 import datetime
 import json
 import requests
@@ -297,47 +294,50 @@ def get_access_token():
         logger.error(f"Error getting access token: {str(e)}")
         raise
 
-def get_month_range(months_back=1):
+def get_month_range(months_back):
     """
     Get date range for a specific month in the past
     months_back=1 means previous month
-    months_back=2 means 2 months ago, etc.
+    months_back=2 means 2 months ago
     """
     today = datetime.date.today()
     
-    # Start from current month
-    current_month = today.replace(day=1)
+    # Calculate target year and month
+    current_year = today.year
+    current_month = today.month
     
-    # Go back the specified number of months
-    target_month = current_month
-    for _ in range(months_back):
-        target_month = (target_month - datetime.timedelta(days=1)).replace(day=1)
+    target_month = current_month - months_back
+    target_year = current_year
+    
+    # Handle year boundaries
+    while target_month <= 0:
+        target_month += 12
+        target_year -= 1
+    
+    # Get first day of target month
+    first_day = datetime.date(target_year, target_month, 1)
     
     # Get last day of target month
-    next_month = target_month.replace(day=28) + datetime.timedelta(days=4)
-    last_day = (next_month - datetime.timedelta(days=next_month.day)).replace(day=target_month.day)
-    
-    # Find actual last day
-    if target_month.month == 12:
-        last_day = target_month.replace(day=31)
+    if target_month == 12:
+        last_day = datetime.date(target_year, 12, 31)
     else:
-        next_month_first = target_month.replace(month=target_month.month + 1, day=1)
+        next_month_first = datetime.date(target_year, target_month + 1, 1)
         last_day = next_month_first - datetime.timedelta(days=1)
     
-    logger.info(f"Today: {today}")
-    logger.info(f"Target month ({months_back} months back): {target_month} to {last_day}")
+    return first_day.isoformat(), last_day.isoformat()
+
+def get_last_two_months_ranges():
+    """Get date ranges for last 2 months"""
+    # Month 1: Previous month (e.g., December 2025)
+    month1_start, month1_end = get_month_range(1)
     
-    return target_month.isoformat(), last_day.isoformat()
-
-def get_previous_month_range():
-    """Get previous month (1 month back)"""
-    return get_month_range(1)
-
-def get_current_month_range():
-    """Get current month date range for testing"""
-    today = datetime.date.today()
-    first_day_this_month = today.replace(day=1)
-    return first_day_this_month.isoformat(), today.isoformat()
+    # Month 2: 2 months ago (e.g., November 2024)
+    month2_start, month2_end = get_month_range(2)
+    
+    logger.info(f"Month 1 (1 month back): {month1_start} to {month1_end}")
+    logger.info(f"Month 2 (2 months back): {month2_start} to {month2_end}")
+    
+    return [(month1_start, month1_end), (month2_start, month2_end)]
 
 def get_all_subscriptions(token):
     """Fetch all subscriptions accessible to the service principal"""
@@ -395,8 +395,8 @@ def fetch_cost_for_subscription(token, subscription_id, start_date, end_date):
         # Return empty structure if cost fetch fails
         return {"properties": {"rows": [], "columns": []}}
 
-def generate_excel(all_costs_data, start_date, end_date):
-    """Generate Excel with all subscriptions cost data"""
+def generate_excel(all_costs_data):
+    """Generate Excel with all subscriptions cost data for last 2 months"""
     try:
         wb = Workbook()
         ws = wb.active
@@ -407,7 +407,7 @@ def generate_excel(all_costs_data, start_date, end_date):
         header_font = Font(bold=True, color="FFFFFF")
         
         # Add headers
-        headers = ["Subscription Name", "Subscription ID", "From Date", "To Date", "Total Cost (USD)", "Status"]
+        headers = ["Subscription Name", "Subscription ID", "Month 1", "Month 1 Cost (USD)", "Month 2", "Month 2 Cost (USD)", "Total Cost (USD)", "Status"]
         ws.append(headers)
         
         # Style header row
@@ -416,31 +416,42 @@ def generate_excel(all_costs_data, start_date, end_date):
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-        total_cost_all = 0.0
+        grand_total_month1 = 0.0
+        grand_total_month2 = 0.0
         
         # Add data for each subscription
         for sub_data in all_costs_data:
             subscription_name = sub_data["subscription_name"]
             subscription_id = sub_data["subscription_id"]
-            cost_data = sub_data["cost_data"]
+            month1_data = sub_data["month1_data"]
+            month2_data = sub_data["month2_data"]
+            month1_period = sub_data["month1_period"]
+            month2_period = sub_data["month2_period"]
             
-            # Extract cost
-            rows = cost_data.get("properties", {}).get("rows", [])
+            # Extract costs
+            month1_rows = month1_data.get("properties", {}).get("rows", [])
+            month2_rows = month2_data.get("properties", {}).get("rows", [])
             
-            if not rows or len(rows) == 0:
-                total_cost = 0.0
-                status = "No usage data"
-            else:
-                total_cost = float(rows[0][0]) if len(rows[0]) > 0 else 0.0
+            month1_cost = float(month1_rows[0][0]) if month1_rows and len(month1_rows[0]) > 0 else 0.0
+            month2_cost = float(month2_rows[0][0]) if month2_rows and len(month2_rows[0]) > 0 else 0.0
+            
+            total_cost = month1_cost + month2_cost
+            
+            grand_total_month1 += month1_cost
+            grand_total_month2 += month2_cost
+            
+            if total_cost > 0:
                 status = "Active"
-            
-            total_cost_all += total_cost
+            else:
+                status = "No usage data"
             
             ws.append([
                 subscription_name,
                 subscription_id,
-                start_date,
-                end_date,
+                month1_period,
+                round(month1_cost, 2),
+                month2_period,
+                round(month2_cost, 2),
                 round(total_cost, 2),
                 status
             ])
@@ -448,7 +459,7 @@ def generate_excel(all_costs_data, start_date, end_date):
         # Add total row
         ws.append([])
         total_row = ws.max_row
-        ws.append(["TOTAL", "", "", "", round(total_cost_all, 2), ""])
+        ws.append(["TOTAL", "", "", round(grand_total_month1, 2), "", round(grand_total_month2, 2), round(grand_total_month1 + grand_total_month2, 2), ""])
         
         # Style total row
         for cell in ws[total_row]:
@@ -458,10 +469,12 @@ def generate_excel(all_costs_data, start_date, end_date):
         # Adjust column widths
         ws.column_dimensions['A'].width = 35
         ws.column_dimensions['B'].width = 40
-        ws.column_dimensions['C'].width = 15
-        ws.column_dimensions['D'].width = 15
+        ws.column_dimensions['C'].width = 20
+        ws.column_dimensions['D'].width = 20
         ws.column_dimensions['E'].width = 20
-        ws.column_dimensions['F'].width = 15
+        ws.column_dimensions['F'].width = 20
+        ws.column_dimensions['G'].width = 20
+        ws.column_dimensions['H'].width = 15
 
         # Add summary info
         ws.append([])
@@ -496,16 +509,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         logger.info("Getting access token...")
         token = get_access_token()
         
-        # Check query parameter for date range
-        date_range = req.params.get('range', 'previous')  # 'previous' or 'current'
-        
-        logger.info("Getting date range...")
-        if date_range == 'current':
-            start_date, end_date = get_current_month_range()
-            logger.info(f"Fetching CURRENT month cost: {start_date} to {end_date}")
-        else:
-            start_date, end_date = get_previous_month_range()
-            logger.info(f"Fetching PREVIOUS month cost: {start_date} to {end_date}")
+        logger.info("Getting date ranges for last 2 months...")
+        date_ranges = get_last_two_months_ranges()
+        month1_start, month1_end = date_ranges[0]
+        month2_start, month2_end = date_ranges[1]
         
         logger.info("Fetching all subscriptions...")
         subscriptions = get_all_subscriptions(token)
@@ -519,7 +526,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         
         logger.info(f"Processing {len(subscriptions)} subscriptions...")
         
-        # Fetch cost for each subscription
+        # Fetch cost for each subscription for both months
         all_costs_data = []
         for subscription in subscriptions:
             sub_id = subscription.get("subscriptionId")
@@ -527,18 +534,27 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             
             logger.info(f"Fetching cost for: {sub_name} ({sub_id})")
             
-            cost_data = fetch_cost_for_subscription(token, sub_id, start_date, end_date)
+            # Fetch Month 1 cost
+            logger.info(f"  Month 1: {month1_start} to {month1_end}")
+            month1_data = fetch_cost_for_subscription(token, sub_id, month1_start, month1_end)
+            
+            # Fetch Month 2 cost
+            logger.info(f"  Month 2: {month2_start} to {month2_end}")
+            month2_data = fetch_cost_for_subscription(token, sub_id, month2_start, month2_end)
             
             all_costs_data.append({
                 "subscription_id": sub_id,
                 "subscription_name": sub_name,
-                "cost_data": cost_data
+                "month1_data": month1_data,
+                "month2_data": month2_data,
+                "month1_period": f"{month1_start} to {month1_end}",
+                "month2_period": f"{month2_start} to {month2_end}"
             })
         
         logger.info("Generating Excel file...")
-        excel_file = generate_excel(all_costs_data, start_date, end_date)
+        excel_file = generate_excel(all_costs_data)
 
-        filename = f"azure_all_subscriptions_cost_{start_date}_to_{end_date}.xlsx"
+        filename = f"azure_cost_last_2_months_{datetime.date.today().isoformat()}.xlsx"
 
         logger.info("Returning Excel file...")
         return func.HttpResponse(
