@@ -4,21 +4,35 @@ import requests
 import os
 import io
 import logging
+import traceback
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import azure.functions as func
 
 # Setup logging
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 def get_access_token():
+    """Get Azure access token using service principal credentials"""
     try:
+        logger.info("Starting token acquisition...")
+        
         TENANT_ID = os.environ.get("TENANT_ID")
         CLIENT_ID = os.environ.get("CLIENT_ID")
         CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
         
-        if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
-            raise ValueError("Missing environment variables: TENANT_ID, CLIENT_ID, or CLIENT_SECRET")
+        # Detailed validation
+        if not TENANT_ID:
+            raise ValueError("TENANT_ID environment variable is not set")
+        if not CLIENT_ID:
+            raise ValueError("CLIENT_ID environment variable is not set")
+        if not CLIENT_SECRET:
+            raise ValueError("CLIENT_SECRET environment variable is not set")
+        
+        logger.info(f"TENANT_ID: {TENANT_ID[:8]}... (length: {len(TENANT_ID)})")
+        logger.info(f"CLIENT_ID: {CLIENT_ID[:8]}... (length: {len(CLIENT_ID)})")
+        logger.info(f"CLIENT_SECRET: {'*' * 8}... (length: {len(CLIENT_SECRET)})")
         
         url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/token"
         payload = {
@@ -27,50 +41,106 @@ def get_access_token():
             "client_secret": CLIENT_SECRET,
             "resource": "https://management.azure.com/"
         }
-        response = requests.post(url, data=payload)
-        response.raise_for_status()
-        return response.json()["access_token"]
+        
+        logger.info(f"Requesting token from: {url}")
+        response = requests.post(url, data=payload, timeout=30)
+        
+        if response.status_code != 200:
+            logger.error(f"Token request failed with status {response.status_code}")
+            logger.error(f"Response: {response.text}")
+            response.raise_for_status()
+        
+        token_data = response.json()
+        logger.info("Access token acquired successfully")
+        return token_data["access_token"]
+        
+    except requests.exceptions.Timeout as e:
+        logger.error(f"Timeout while getting access token: {str(e)}")
+        raise Exception(f"Authentication timeout: {str(e)}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error getting access token: {str(e)}")
+        if hasattr(e.response, 'text'):
+            logger.error(f"Error response: {e.response.text}")
+        raise Exception(f"Authentication failed: {str(e)}")
+    except KeyError as e:
+        logger.error(f"Missing key in token response: {str(e)}")
+        raise Exception(f"Invalid token response: {str(e)}")
     except Exception as e:
-        logger.error(f"Error getting access token: {str(e)}")
+        logger.error(f"Unexpected error getting access token: {str(e)}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
 def get_previous_month_range():
-    today = datetime.date.today()
-    first_day_this_month = today.replace(day=1)
-    last_day_prev_month = first_day_this_month - datetime.timedelta(days=1)
-    first_day_prev_month = last_day_prev_month.replace(day=1)
-    return first_day_prev_month.isoformat(), last_day_prev_month.isoformat()
+    """Calculate the first and last day of the previous month"""
+    try:
+        today = datetime.date.today()
+        first_day_this_month = today.replace(day=1)
+        last_day_prev_month = first_day_this_month - datetime.timedelta(days=1)
+        first_day_prev_month = last_day_prev_month.replace(day=1)
+        
+        start_date = first_day_prev_month.isoformat()
+        end_date = last_day_prev_month.isoformat()
+        
+        logger.info(f"Date range calculated: {start_date} to {end_date}")
+        return start_date, end_date
+        
+    except Exception as e:
+        logger.error(f"Error calculating date range: {str(e)}")
+        raise
 
 def get_all_subscriptions(token):
     """Fetch all subscriptions accessible to the service principal"""
     try:
+        logger.info("Fetching subscriptions...")
         url = "https://management.azure.com/subscriptions?api-version=2020-01-01"
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
         
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            logger.error(f"Subscription fetch failed with status {response.status_code}")
+            logger.error(f"Response: {response.text}")
+            response.raise_for_status()
         
         subscriptions = response.json().get("value", [])
         logger.info(f"Found {len(subscriptions)} subscriptions")
         
+        if not subscriptions:
+            logger.warning("No subscriptions found for this service principal")
+        else:
+            for sub in subscriptions[:3]:  # Log first 3 subscriptions
+                logger.info(f"  - {sub.get('displayName')} ({sub.get('subscriptionId')})")
+        
         return subscriptions
-    except Exception as e:
+        
+    except requests.exceptions.Timeout as e:
+        logger.error(f"Timeout fetching subscriptions: {str(e)}")
+        raise Exception(f"Subscription fetch timeout: {str(e)}")
+    except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching subscriptions: {str(e)}")
+        if hasattr(e.response, 'text'):
+            logger.error(f"Error response: {e.response.text}")
+        raise Exception(f"Failed to fetch subscriptions: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error fetching subscriptions: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
 def fetch_cost_for_subscription(token, subscription_id, start_date, end_date):
     """Fetch cost data for a specific subscription"""
     try:
+        logger.info(f"Fetching cost for subscription: {subscription_id}")
+        
         url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.CostManagement/query?api-version=2023-03-01"
-
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
-
+        
         body = {
             "type": "ActualCost",
             "timeframe": "Custom",
@@ -88,22 +158,37 @@ def fetch_cost_for_subscription(token, subscription_id, start_date, end_date):
                 }
             }
         }
-
-        response = requests.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        return response.json()
+        
+        response = requests.post(url, headers=headers, json=body, timeout=60)
+        
+        if response.status_code != 200:
+            logger.warning(f"Cost fetch failed for {subscription_id} with status {response.status_code}")
+            logger.warning(f"Response: {response.text}")
+            # Return empty structure instead of raising error
+            return {"properties": {"rows": [], "columns": []}}
+        
+        cost_data = response.json()
+        rows = cost_data.get("properties", {}).get("rows", [])
+        logger.info(f"  Cost data retrieved: {len(rows)} rows")
+        
+        return cost_data
+        
+    except requests.exceptions.Timeout as e:
+        logger.warning(f"Timeout fetching cost for {subscription_id}: {str(e)}")
+        return {"properties": {"rows": [], "columns": []}}
     except Exception as e:
-        logger.error(f"Error fetching cost for subscription {subscription_id}: {str(e)}")
-        # Return empty structure if cost fetch fails
+        logger.warning(f"Error fetching cost for {subscription_id}: {str(e)}")
         return {"properties": {"rows": [], "columns": []}}
 
 def generate_excel(all_costs_data, start_date, end_date):
     """Generate Excel with all subscriptions cost data"""
     try:
+        logger.info("Generating Excel file...")
+        
         wb = Workbook()
         ws = wb.active
         ws.title = "Azure Cost Report"
-
+        
         # Header styling
         header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF")
@@ -117,7 +202,7 @@ def generate_excel(all_costs_data, start_date, end_date):
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center")
-
+        
         total_cost_all = 0.0
         
         # Add data for each subscription
@@ -128,13 +213,12 @@ def generate_excel(all_costs_data, start_date, end_date):
             
             # Extract cost
             rows = cost_data.get("properties", {}).get("rows", [])
-            
             if not rows or len(rows) == 0:
                 total_cost = 0.0
                 status = "No usage data"
             else:
                 total_cost = float(rows[0][0]) if len(rows[0]) > 0 else 0.0
-                status = "Active"
+                status = "Active" if total_cost > 0 else "No charges"
             
             total_cost_all += total_cost
             
@@ -146,7 +230,7 @@ def generate_excel(all_costs_data, start_date, end_date):
                 round(total_cost, 2),
                 status
             ])
-
+        
         # Add total row
         ws.append([])
         total_row = ws.max_row
@@ -156,7 +240,7 @@ def generate_excel(all_costs_data, start_date, end_date):
         for cell in ws[total_row]:
             cell.font = Font(bold=True)
             cell.fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
-
+        
         # Adjust column widths
         ws.column_dimensions['A'].width = 35
         ws.column_dimensions['B'].width = 40
@@ -164,63 +248,87 @@ def generate_excel(all_costs_data, start_date, end_date):
         ws.column_dimensions['D'].width = 15
         ws.column_dimensions['E'].width = 20
         ws.column_dimensions['F'].width = 15
-
+        
         # Add summary info
         ws.append([])
         ws.append([f"Report Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
         ws.append([f"Total Subscriptions: {len(all_costs_data)}"])
-
+        
         file_stream = io.BytesIO()
         wb.save(file_stream)
         file_stream.seek(0)
+        
+        logger.info(f"Excel file generated successfully ({len(all_costs_data)} subscriptions, Total: ${round(total_cost_all, 2)})")
         return file_stream
+        
     except Exception as e:
-        logger.error(f"Error generating excel: {str(e)}")
+        logger.error(f"Error generating Excel: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logger.info('Python HTTP trigger function processed a request.')
+    """Main function entry point"""
+    logger.info('=' * 80)
+    logger.info('Azure Cost Report Function - Starting execution')
+    logger.info('=' * 80)
     
     try:
-        # Check environment variables
+        # Step 1: Validate environment variables
+        logger.info("Step 1: Validating environment variables...")
         required_vars = ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET"]
         missing_vars = [var for var in required_vars if not os.environ.get(var)]
         
         if missing_vars:
             error_msg = f"Missing environment variables: {', '.join(missing_vars)}"
             logger.error(error_msg)
+            logger.error("Please configure these in Azure Function App Settings")
             return func.HttpResponse(
-                body=json.dumps({"error": error_msg}),
+                body=json.dumps({
+                    "error": error_msg,
+                    "details": "Configure environment variables in Azure Portal → Function App → Configuration → Application Settings"
+                }),
                 status_code=500,
                 mimetype="application/json"
             )
         
-        logger.info("Getting access token...")
+        logger.info("✓ All environment variables present")
+        
+        # Step 2: Get access token
+        logger.info("Step 2: Acquiring Azure access token...")
         token = get_access_token()
+        logger.info("✓ Access token acquired")
         
-        logger.info("Getting date range...")
+        # Step 3: Calculate date range
+        logger.info("Step 3: Calculating date range...")
         start_date, end_date = get_previous_month_range()
-        logger.info(f"Date range: {start_date} to {end_date}")
+        logger.info(f"✓ Date range: {start_date} to {end_date}")
         
-        logger.info("Fetching all subscriptions...")
+        # Step 4: Fetch subscriptions
+        logger.info("Step 4: Fetching all subscriptions...")
         subscriptions = get_all_subscriptions(token)
         
         if not subscriptions:
+            logger.warning("No subscriptions found")
             return func.HttpResponse(
-                body=json.dumps({"error": "No subscriptions found"}),
+                body=json.dumps({
+                    "error": "No subscriptions found",
+                    "details": "The service principal has no access to any subscriptions"
+                }),
                 status_code=404,
                 mimetype="application/json"
             )
         
-        logger.info(f"Processing {len(subscriptions)} subscriptions...")
+        logger.info(f"✓ Found {len(subscriptions)} subscriptions")
         
-        # Fetch cost for each subscription
+        # Step 5: Fetch cost data for each subscription
+        logger.info("Step 5: Fetching cost data for all subscriptions...")
         all_costs_data = []
-        for subscription in subscriptions:
+        
+        for idx, subscription in enumerate(subscriptions, 1):
             sub_id = subscription.get("subscriptionId")
             sub_name = subscription.get("displayName", "Unknown")
             
-            logger.info(f"Fetching cost for: {sub_name} ({sub_id})")
+            logger.info(f"  [{idx}/{len(subscriptions)}] Processing: {sub_name}")
             
             cost_data = fetch_cost_for_subscription(token, sub_id, start_date, end_date)
             
@@ -230,12 +338,20 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "cost_data": cost_data
             })
         
-        logger.info("Generating Excel file...")
+        logger.info("✓ Cost data fetched for all subscriptions")
+        
+        # Step 6: Generate Excel file
+        logger.info("Step 6: Generating Excel report...")
         excel_file = generate_excel(all_costs_data, start_date, end_date)
-
+        logger.info("✓ Excel report generated")
+        
+        # Step 7: Return file
         filename = f"azure_all_subscriptions_cost_{start_date}_to_{end_date}.xlsx"
-
-        logger.info("Returning Excel file...")
+        logger.info(f"Step 7: Returning file: {filename}")
+        logger.info('=' * 80)
+        logger.info('Execution completed successfully!')
+        logger.info('=' * 80)
+        
         return func.HttpResponse(
             body=excel_file.read(),
             status_code=200,
@@ -244,336 +360,58 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             }
         )
-
-    except Exception as e:
-        error_msg = f"Error: {str(e)}"
-        logger.error(error_msg, exc_info=True)
+        
+    except ValueError as ve:
+        error_msg = f"Configuration error: {str(ve)}"
+        logger.error('=' * 80)
+        logger.error('EXECUTION FAILED - Configuration Error')
+        logger.error('=' * 80)
+        logger.error(error_msg)
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
         return func.HttpResponse(
             body=json.dumps({
-                "error": str(e),
-                "type": type(e).__name__
+                "error": error_msg,
+                "type": "ConfigurationError",
+                "traceback": traceback.format_exc()
             }),
             status_code=500,
             mimetype="application/json"
         )
-
-
-# import datetime
-# import json
-# import requests
-# import os
-# import io
-# import logging
-# from openpyxl import Workbook
-# from openpyxl.styles import Font, PatternFill, Alignment
-# import azure.functions as func
-
-# # Setup logging
-# logger = logging.getLogger(__name__)
-
-# def get_access_token():
-#     try:
-#         TENANT_ID = os.environ.get("TENANT_ID")
-#         CLIENT_ID = os.environ.get("CLIENT_ID")
-#         CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
         
-#         if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET]):
-#             raise ValueError("Missing environment variables: TENANT_ID, CLIENT_ID, or CLIENT_SECRET")
+    except requests.exceptions.RequestException as re:
+        error_msg = f"Azure API error: {str(re)}"
+        logger.error('=' * 80)
+        logger.error('EXECUTION FAILED - API Error')
+        logger.error('=' * 80)
+        logger.error(error_msg)
+        logger.error(f"Traceback: {traceback.format_exc()}")
         
-#         url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/token"
-#         payload = {
-#             "grant_type": "client_credentials",
-#             "client_id": CLIENT_ID,
-#             "client_secret": CLIENT_SECRET,
-#             "resource": "https://management.azure.com/"
-#         }
-#         response = requests.post(url, data=payload)
-#         response.raise_for_status()
-#         return response.json()["access_token"]
-#     except Exception as e:
-#         logger.error(f"Error getting access token: {str(e)}")
-#         raise
-
-# def get_month_range(months_back):
-#     """
-#     Get date range for a specific month in the past
-#     months_back=1 means previous month
-#     months_back=2 means 2 months ago
-#     """
-#     today = datetime.date.today()
-    
-#     # Calculate target year and month
-#     current_year = today.year
-#     current_month = today.month
-    
-#     target_month = current_month - months_back
-#     target_year = current_year
-    
-#     # Handle year boundaries
-#     while target_month <= 0:
-#         target_month += 12
-#         target_year -= 1
-    
-#     # Get first day of target month
-#     first_day = datetime.date(target_year, target_month, 1)
-    
-#     # Get last day of target month
-#     if target_month == 12:
-#         last_day = datetime.date(target_year, 12, 31)
-#     else:
-#         next_month_first = datetime.date(target_year, target_month + 1, 1)
-#         last_day = next_month_first - datetime.timedelta(days=1)
-    
-#     return first_day.isoformat(), last_day.isoformat()
-
-# def get_last_two_months_ranges():
-#     """Get date ranges for last 2 months"""
-#     # Month 1: Previous month (e.g., December 2025)
-#     month1_start, month1_end = get_month_range(1)
-    
-#     # Month 2: 2 months ago (e.g., November 2024)
-#     month2_start, month2_end = get_month_range(2)
-    
-#     logger.info(f"Month 1 (1 month back): {month1_start} to {month1_end}")
-#     logger.info(f"Month 2 (2 months back): {month2_start} to {month2_end}")
-    
-#     return [(month1_start, month1_end), (month2_start, month2_end)]
-
-# def get_all_subscriptions(token):
-#     """Fetch all subscriptions accessible to the service principal"""
-#     try:
-#         url = "https://management.azure.com/subscriptions?api-version=2020-01-01"
-#         headers = {
-#             "Authorization": f"Bearer {token}",
-#             "Content-Type": "application/json"
-#         }
+        return func.HttpResponse(
+            body=json.dumps({
+                "error": error_msg,
+                "type": "APIError",
+                "traceback": traceback.format_exc()
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
         
-#         response = requests.get(url, headers=headers)
-#         response.raise_for_status()
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error('=' * 80)
+        logger.error('EXECUTION FAILED - Unexpected Error')
+        logger.error('=' * 80)
+        logger.error(error_msg)
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         
-#         subscriptions = response.json().get("value", [])
-#         logger.info(f"Found {len(subscriptions)} subscriptions")
-        
-#         return subscriptions
-#     except Exception as e:
-#         logger.error(f"Error fetching subscriptions: {str(e)}")
-#         raise
-
-# def fetch_cost_for_subscription(token, subscription_id, start_date, end_date):
-#     """Fetch cost data for a specific subscription"""
-#     try:
-#         url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.CostManagement/query?api-version=2023-03-01"
-
-#         headers = {
-#             "Authorization": f"Bearer {token}",
-#             "Content-Type": "application/json"
-#         }
-
-#         body = {
-#             "type": "ActualCost",
-#             "timeframe": "Custom",
-#             "timePeriod": {
-#                 "from": start_date,
-#                 "to": end_date
-#             },
-#             "dataset": {
-#                 "granularity": "None",
-#                 "aggregation": {
-#                     "totalCost": {
-#                         "name": "Cost",
-#                         "function": "Sum"
-#                     }
-#                 }
-#             }
-#         }
-
-#         response = requests.post(url, headers=headers, json=body)
-#         response.raise_for_status()
-#         return response.json()
-#     except Exception as e:
-#         logger.error(f"Error fetching cost for subscription {subscription_id}: {str(e)}")
-#         # Return empty structure if cost fetch fails
-#         return {"properties": {"rows": [], "columns": []}}
-
-# def generate_excel(all_costs_data):
-#     """Generate Excel with all subscriptions cost data for last 2 months"""
-#     try:
-#         wb = Workbook()
-#         ws = wb.active
-#         ws.title = "Azure Cost Report"
-
-#         # Header styling
-#         header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-#         header_font = Font(bold=True, color="FFFFFF")
-        
-#         # Add headers
-#         headers = ["Subscription Name", "Subscription ID", "Month 1", "Month 1 Cost (USD)", "Month 2", "Month 2 Cost (USD)", "Total Cost (USD)", "Status"]
-#         ws.append(headers)
-        
-#         # Style header row
-#         for cell in ws[1]:
-#             cell.fill = header_fill
-#             cell.font = header_font
-#             cell.alignment = Alignment(horizontal="center", vertical="center")
-
-#         grand_total_month1 = 0.0
-#         grand_total_month2 = 0.0
-        
-#         # Add data for each subscription
-#         for sub_data in all_costs_data:
-#             subscription_name = sub_data["subscription_name"]
-#             subscription_id = sub_data["subscription_id"]
-#             month1_data = sub_data["month1_data"]
-#             month2_data = sub_data["month2_data"]
-#             month1_period = sub_data["month1_period"]
-#             month2_period = sub_data["month2_period"]
-            
-#             # Extract costs
-#             month1_rows = month1_data.get("properties", {}).get("rows", [])
-#             month2_rows = month2_data.get("properties", {}).get("rows", [])
-            
-#             month1_cost = float(month1_rows[0][0]) if month1_rows and len(month1_rows[0]) > 0 else 0.0
-#             month2_cost = float(month2_rows[0][0]) if month2_rows and len(month2_rows[0]) > 0 else 0.0
-            
-#             total_cost = month1_cost + month2_cost
-            
-#             grand_total_month1 += month1_cost
-#             grand_total_month2 += month2_cost
-            
-#             if total_cost > 0:
-#                 status = "Active"
-#             else:
-#                 status = "No usage data"
-            
-#             ws.append([
-#                 subscription_name,
-#                 subscription_id,
-#                 month1_period,
-#                 round(month1_cost, 2),
-#                 month2_period,
-#                 round(month2_cost, 2),
-#                 round(total_cost, 2),
-#                 status
-#             ])
-
-#         # Add total row
-#         ws.append([])
-#         total_row = ws.max_row
-#         ws.append(["TOTAL", "", "", round(grand_total_month1, 2), "", round(grand_total_month2, 2), round(grand_total_month1 + grand_total_month2, 2), ""])
-        
-#         # Style total row
-#         for cell in ws[total_row]:
-#             cell.font = Font(bold=True)
-#             cell.fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
-
-#         # Adjust column widths
-#         ws.column_dimensions['A'].width = 35
-#         ws.column_dimensions['B'].width = 40
-#         ws.column_dimensions['C'].width = 20
-#         ws.column_dimensions['D'].width = 20
-#         ws.column_dimensions['E'].width = 20
-#         ws.column_dimensions['F'].width = 20
-#         ws.column_dimensions['G'].width = 20
-#         ws.column_dimensions['H'].width = 15
-
-#         # Add summary info
-#         ws.append([])
-#         ws.append([f"Report Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
-#         ws.append([f"Total Subscriptions: {len(all_costs_data)}"])
-
-#         file_stream = io.BytesIO()
-#         wb.save(file_stream)
-#         file_stream.seek(0)
-#         return file_stream
-#     except Exception as e:
-#         logger.error(f"Error generating excel: {str(e)}")
-#         raise
-
-# def main(req: func.HttpRequest) -> func.HttpResponse:
-#     logger.info('Python HTTP trigger function processed a request.')
-    
-#     try:
-#         # Check environment variables
-#         required_vars = ["TENANT_ID", "CLIENT_ID", "CLIENT_SECRET"]
-#         missing_vars = [var for var in required_vars if not os.environ.get(var)]
-        
-#         if missing_vars:
-#             error_msg = f"Missing environment variables: {', '.join(missing_vars)}"
-#             logger.error(error_msg)
-#             return func.HttpResponse(
-#                 body=json.dumps({"error": error_msg}),
-#                 status_code=500,
-#                 mimetype="application/json"
-#             )
-        
-#         logger.info("Getting access token...")
-#         token = get_access_token()
-        
-#         logger.info("Getting date ranges for last 2 months...")
-#         date_ranges = get_last_two_months_ranges()
-#         month1_start, month1_end = date_ranges[0]
-#         month2_start, month2_end = date_ranges[1]
-        
-#         logger.info("Fetching all subscriptions...")
-#         subscriptions = get_all_subscriptions(token)
-        
-#         if not subscriptions:
-#             return func.HttpResponse(
-#                 body=json.dumps({"error": "No subscriptions found"}),
-#                 status_code=404,
-#                 mimetype="application/json"
-#             )
-        
-#         logger.info(f"Processing {len(subscriptions)} subscriptions...")
-        
-#         # Fetch cost for each subscription for both months
-#         all_costs_data = []
-#         for subscription in subscriptions:
-#             sub_id = subscription.get("subscriptionId")
-#             sub_name = subscription.get("displayName", "Unknown")
-            
-#             logger.info(f"Fetching cost for: {sub_name} ({sub_id})")
-            
-#             # Fetch Month 1 cost
-#             logger.info(f"  Month 1: {month1_start} to {month1_end}")
-#             month1_data = fetch_cost_for_subscription(token, sub_id, month1_start, month1_end)
-            
-#             # Fetch Month 2 cost
-#             logger.info(f"  Month 2: {month2_start} to {month2_end}")
-#             month2_data = fetch_cost_for_subscription(token, sub_id, month2_start, month2_end)
-            
-#             all_costs_data.append({
-#                 "subscription_id": sub_id,
-#                 "subscription_name": sub_name,
-#                 "month1_data": month1_data,
-#                 "month2_data": month2_data,
-#                 "month1_period": f"{month1_start} to {month1_end}",
-#                 "month2_period": f"{month2_start} to {month2_end}"
-#             })
-        
-#         logger.info("Generating Excel file...")
-#         excel_file = generate_excel(all_costs_data)
-
-#         filename = f"azure_cost_last_2_months_{datetime.date.today().isoformat()}.xlsx"
-
-#         logger.info("Returning Excel file...")
-#         return func.HttpResponse(
-#             body=excel_file.read(),
-#             status_code=200,
-#             headers={
-#                 "Content-Disposition": f"attachment; filename={filename}",
-#                 "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-#             }
-#         )
-
-#     except Exception as e:
-#         error_msg = f"Error: {str(e)}"
-#         logger.error(error_msg, exc_info=True)
-#         return func.HttpResponse(
-#             body=json.dumps({
-#                 "error": str(e),
-#                 "type": type(e).__name__
-#             }),
-#             status_code=500,
-#             mimetype="application/json"
-#         )
+        return func.HttpResponse(
+            body=json.dumps({
+                "error": str(e),
+                "type": type(e).__name__,
+                "traceback": traceback.format_exc()
+            }),
+            status_code=500,
+            mimetype="application/json"
+        )
